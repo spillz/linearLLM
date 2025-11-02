@@ -34,13 +34,18 @@ def count_ngrams(ids, order):
     for k in range(1, order+1):
         totals[k] = collections.Counter()
         nexts[k]  = {}
-    # iterate through sequence
-    for i in range(1, len(ids)):
+
+    # i is the index of the NEXT symbol; context ends at i-1
+    for i in range(len(ids)):
+        nxt = ids[i]
         for k in range(1, order+1):
-            ctx_len = k-1
-            if i-ctx_len-1 < 0: continue
-            ctx = tuple(ids[i-ctx_len-1:i-1]) if ctx_len>0 else ()
-            nxt = ids[i]
+            ctx_len = k - 1
+            if i - ctx_len < 0:
+                continue  # not enough history yet
+            if ctx_len > 0:
+                ctx = tuple(ids[i-ctx_len:i])  # previous k-1 tokens
+            else:
+                ctx = ()  # unigram context
             totals[k][ctx] += 1
             d = nexts[k].get(ctx)
             if d is None:
