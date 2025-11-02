@@ -198,6 +198,7 @@ def main():
     ap.add_argument("--top_k", type=int, default=50)
 
     # Saving / REPL
+    ap.add_argument("--load_path", type=str, default="tinyshake_transformer.pt")
     ap.add_argument("--save_path", type=str, default="tinyshake_transformer.pt")
     ap.add_argument("--force_save", action="store_true", help="overwrite save_path without asking")
     ap.add_argument("--repl_max_new", type=int, default=400, help="max new chars per REPL generation")
@@ -210,92 +211,148 @@ def main():
     device = get_device(args.device)
     print(f"Using device: {device}")
 
-    # Load and prep data
-    if not os.path.exists(args.txt):
-        print(f"ERROR: file not found: {args.txt}", file=sys.stderr); sys.exit(1)
-    text = load_text(args.txt)
-    chars, stoi, itos = build_vocab(text)
-    V = len(chars)
-    ids = encode(text, stoi)
-    ids_tr, ids_va = split_train_valid(ids, args.valid_frac)
+    if args.load_path and os.path.exists(args.load_path):
+        # ----- Load pretrained checkpoint (config + vocab + weights) -----
+        ckpt = torch.load(args.load_path, map_location="cpu")
+        if isinstance(ckpt, dict) and "state_dict" in ckpt and "vocab" in ckpt and "config" in ckpt:
+            # restore hyperparameters so the instantiated model matches the checkpoint
+            cfg = ckpt["config"]
+            for k in ("block_size", "d_model", "n_layer", "n_head", "dropout"):
+                if k in cfg:
+                    setattr(args, k, cfg[k])
 
-    train_ds = CharDataset(ids_tr, args.block_size)
+            # restore vocabulary for REPL
+            vocab = ckpt["vocab"]
+            chars, stoi, itos = vocab["chars"], vocab["stoi"], vocab["itos"]
+            V = len(chars)
 
-    model = GPTMini(
-        vocab_size=V, block_size=args.block_size,
-        d_model=args.d_model, n_layer=args.n_layer, n_head=args.n_head,
-        dropout=args.dropout
-    ).to(device)
+            # build and load model
+            model = GPTMini(
+                vocab_size=V,
+                block_size=args.block_size,
+                d_model=args.d_model,
+                n_layer=args.n_layer,
+                n_head=args.n_head,
+                dropout=args.dropout,
+            ).to(device)
+            missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
+            if missing or unexpected:
+                print(f"Warning: while loading, missing={missing}, unexpected={unexpected}", file=sys.stderr)
+            print(f"Loaded checkpoint from {args.load_path} (V={V}, block_size={args.block_size}, "
+                f"d_model={args.d_model}, n_layer={args.n_layer}, n_head={args.n_head}, dropout={args.dropout})")
+        else:
+            # Fallback: try to rebuild vocab from --txt, then load raw state_dict (if provided)
+            if not os.path.exists(args.txt):
+                print(f"ERROR: '{args.load_path}' is not a full checkpoint and --txt not found to rebuild vocab.", file=sys.stderr)
+                sys.exit(1)
+            text = load_text(args.txt)
+            chars, stoi, itos = build_vocab(text)
+            V = len(chars)
+            model = GPTMini(
+                vocab_size=V,
+                block_size=args.block_size,
+                d_model=args.d_model,
+                n_layer=args.n_layer,
+                n_head=args.n_head,
+                dropout=args.dropout,
+            ).to(device)
+            if isinstance(ckpt, dict):
+                try:
+                    model.load_state_dict(ckpt, strict=False)  # raw state_dict case
+                    print(f"Loaded raw state_dict from {args.load_path} with vocab rebuilt from {args.txt} (V={V}).")
+                except Exception as e:
+                    print(f"ERROR loading state_dict from {args.load_path}: {e}", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                print(f"ERROR: Unrecognized checkpoint format in {args.load_path}.", file=sys.stderr)
+                sys.exit(1)
+    else:
+        # Load and prep data
+        if not os.path.exists(args.txt):
+            print(f"ERROR: file not found: {args.txt}", file=sys.stderr); sys.exit(1)
+        text = load_text(args.txt)
+        chars, stoi, itos = build_vocab(text)
+        V = len(chars)
+        ids = encode(text, stoi)
+        ids_tr, ids_va = split_train_valid(ids, args.valid_frac)
 
-    # optimizer & schedule
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-    scaler = torch.cuda.amp.GradScaler(enabled=(device=="cuda"))
+        train_ds = CharDataset(ids_tr, args.block_size)
 
-    def lr_at(step):
-        if step < args.warmup_steps:
-            return args.lr * (step / max(1, args.warmup_steps))
-        t = min(1.0, (step - args.warmup_steps)/max(1, args.max_steps - args.warmup_steps))
-        minlr = args.lr * 0.1
-        return minlr + 0.5*(args.lr - minlr)*(1 + math.cos(math.pi*t))
+        model = GPTMini(
+            vocab_size=V, block_size=args.block_size,
+            d_model=args.d_model, n_layer=args.n_layer, n_head=args.n_head,
+            dropout=args.dropout
+        ).to(device)
 
-    # Train
-    global_step = 0
-    t0 = time.time()
-    model.train()
-    for epoch in range(1, args.epochs+1):
-        for it in range(args.steps_per_epoch):
-            x, y = train_ds.get_batch(args.batch_size, device)
-            for pg in optim.param_groups:
-                pg["lr"] = lr_at(global_step)
-            optim.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(device=="cuda")):
-                _, loss = model(x, y)
-            scaler.scale(loss).backward()
-            if args.grad_clip and args.grad_clip > 0:
-                scaler.unscale_(optim)
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optim)
-            scaler.update()
-            global_step += 1
-            if (it+1) % 100 == 0:
-                print(f"epoch {epoch} step {it+1}/{args.steps_per_epoch} | train loss {loss.item():.4f} | lr {optim.param_groups[0]['lr']:.2e}")
+        # optimizer & schedule
+        optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+        scaler = torch.cuda.amp.GradScaler(enabled=(device=="cuda"))
 
-        # epoch-end validation
+        def lr_at(step):
+            if step < args.warmup_steps:
+                return args.lr * (step / max(1, args.warmup_steps))
+            t = min(1.0, (step - args.warmup_steps)/max(1, args.max_steps - args.warmup_steps))
+            minlr = args.lr * 0.1
+            return minlr + 0.5*(args.lr - minlr)*(1 + math.cos(math.pi*t))
+
+        # Train
+        global_step = 0
+        t0 = time.time()
+        model.train()
+        for epoch in range(1, args.epochs+1):
+            for it in range(args.steps_per_epoch):
+                x, y = train_ds.get_batch(args.batch_size, device)
+                for pg in optim.param_groups:
+                    pg["lr"] = lr_at(global_step)
+                optim.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=(device=="cuda")):
+                    _, loss = model(x, y)
+                scaler.scale(loss).backward()
+                if args.grad_clip and args.grad_clip > 0:
+                    scaler.unscale_(optim)
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optim)
+                scaler.update()
+                global_step += 1
+                if (it+1) % 100 == 0:
+                    print(f"epoch {epoch} step {it+1}/{args.steps_per_epoch} | train loss {loss.item():.4f} | lr {optim.param_groups[0]['lr']:.2e}")
+
+            # epoch-end validation
+            val_nll, val_ppl = evaluate(model, ids_va, args.block_size, device)
+            print(f"\n[EPOCH {epoch}] Validation NLL (nats/token): {val_nll:.4f} | Perplexity: {val_ppl:.4f}")
+
+        print(f"\nTraining finished in {(time.time()-t0):.1f}s")
+
+        # Final eval
         val_nll, val_ppl = evaluate(model, ids_va, args.block_size, device)
-        print(f"\n[EPOCH {epoch}] Validation NLL (nats/token): {val_nll:.4f} | Perplexity: {val_ppl:.4f}")
+        print(f"\nFinal Validation NLL (nats/token): {val_nll:.4f}")
+        print(f"Final Validation Perplexity:       {val_ppl:.4f}")
 
-    print(f"\nTraining finished in {(time.time()-t0):.1f}s")
-
-    # Final eval
-    val_nll, val_ppl = evaluate(model, ids_va, args.block_size, device)
-    print(f"\nFinal Validation NLL (nats/token): {val_nll:.4f}")
-    print(f"Final Validation Perplexity:       {val_ppl:.4f}")
-
-    # -----------------------
-    # Save model (+ prompt if exists)
-    # -----------------------
-    def do_save(path):
-        payload = {
-            "state_dict": model.state_dict(),
-            "vocab": {"chars": chars, "stoi": stoi, "itos": itos},
-            "config": {
-                "block_size": args.block_size, "d_model": args.d_model,
-                "n_layer": args.n_layer, "n_head": args.n_head, "dropout": args.dropout
+        # -----------------------
+        # Save model (+ prompt if exists)
+        # -----------------------
+        def do_save(path):
+            payload = {
+                "state_dict": model.state_dict(),
+                "vocab": {"chars": chars, "stoi": stoi, "itos": itos},
+                "config": {
+                    "block_size": args.block_size, "d_model": args.d_model,
+                    "n_layer": args.n_layer, "n_head": args.n_head, "dropout": args.dropout
+                }
             }
-        }
-        torch.save(payload, path)
+            torch.save(payload, path)
 
-    if args.save_path:
-        if os.path.exists(args.save_path) and not args.force_save:
-            ans = input(f"\nFile '{args.save_path}' exists. Overwrite? [y/N]: ").strip().lower()
-            if ans in ("y","yes"):
+        if args.save_path:
+            if os.path.exists(args.save_path) and not args.force_save:
+                ans = input(f"\nFile '{args.save_path}' exists. Overwrite? [y/N]: ").strip().lower()
+                if ans in ("y","yes"):
+                    do_save(args.save_path)
+                    print(f"Saved to {args.save_path}")
+                else:
+                    print("Skipped saving.")
+            else:
                 do_save(args.save_path)
                 print(f"Saved to {args.save_path}")
-            else:
-                print("Skipped saving.")
-        else:
-            do_save(args.save_path)
-            print(f"Saved to {args.save_path}")
 
     # -----------------------
     # REPL (streaming)
